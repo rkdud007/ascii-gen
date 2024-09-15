@@ -1,9 +1,12 @@
-use clap::Parser;
-use image::io::Reader as ImageReader;
 use crate::converter::ToAsciiArt;
+use clap::Parser;
+use ffmpeg_next as ffmpeg;
+use image::{io::Reader as ImageReader, ImageBuffer, Rgb};
+use rodio::{self, Source};
 
 use std::{
     io::{self, stdout, Stdout},
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
@@ -27,14 +30,17 @@ pub struct Args {
     #[arg(long, default_value = "")]
     file: String,
     /// The width of the ASCII art
-    #[arg(long, default_value = "80")]
+    #[arg(long, default_value = "240")]
     width: u32,
     /// The height of the ASCII art
-    #[arg(long, default_value = "50")]
+    #[arg(long, default_value = "120")]
     height: u32,
     /// The gamma of the ASCII art
-    #[arg(long, default_value = "1.0")]
+    #[arg(long, default_value = "0.8")]
     gamma: f32,
+    /// The target frame rate
+    #[arg(long, default_value = "30.0")]
+    frame_rate: Option<f32>,
     /// Whether or not to live edit the ASCII art
     #[arg(long, default_value = "false")]
     live: bool,
@@ -42,32 +48,38 @@ pub struct Args {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
-
-    match args.live {
+    match args.file.ends_with(".mp4") {
         true => {
-            let file = args.file;
-
-            if !std::path::Path::new(&file).exists() {
-                return Err("File does not exist".into());
-            }
-
-            let result = App::run(file);
-
+            let result = App::run_video(args.file.clone(), args); // Call video run method
             println!("{}", result.unwrap());
-
-            Ok(())
-        },
-        false => {
-            let open_file = ImageReader::open(args.file).unwrap();
-            let image = open_file.decode().unwrap();
-            let converter = converter::ImageConverter::new(image);
-            let options = converter::AsciiOptions::new(args.width, args.height, args.gamma);
-            let art = converter.to_ascii_art(Some(options));
-
-            println!("{}", art);
-
             Ok(())
         }
+        false => match args.live {
+            true => {
+                let file = args.file;
+
+                if !std::path::Path::new(&file).exists() {
+                    return Err("File does not exist".into());
+                }
+
+                let result = App::run(file);
+
+                println!("{}", result.unwrap());
+
+                Ok(())
+            }
+            false => {
+                let open_file = ImageReader::open(args.file).unwrap();
+                let image = open_file.decode().unwrap();
+                let converter = converter::ImageConverter::new(image);
+                let options = converter::AsciiOptions::new(args.width, args.height, args.gamma);
+                let art = converter.to_ascii_art(Some(options));
+
+                println!("{}", art);
+
+                Ok(())
+            }
+        },
     }
 }
 
@@ -84,7 +96,7 @@ enum Fields {
     Width,
     Height,
     Gamma,
-    Finish
+    Finish,
 }
 
 impl App {
@@ -96,6 +108,150 @@ impl App {
             gamma: 1.0,
             selected_field: Fields::Width,
         }
+    }
+
+    pub fn run_video(file: String, args: Args) -> io::Result<String> {
+        // Initialize audio output
+        let (_stream, stream_handle) = rodio::OutputStream::try_default().unwrap();
+
+        // Find the audio stream
+
+        // Create a decoder for the audio stream
+
+        // Get the sample rate from the audio stream parameters
+        // let sample_rate = audio_stream.avg_frame_rate();
+
+        // // Start audio playback in a separate thread
+        // let audio_thread = std::thread::spawn(move || {
+        //     let mut audio_packet = ffmpeg::Packet::empty();
+        //     while ictx.packets().next().is_some() {
+        //         if audio_packet.stream() == audio_stream_index {
+        //             audio_decoder.send_packet(&audio_packet).unwrap();
+        //             let mut audio_frame = ffmpeg::frame::Audio::empty();
+        //             while audio_decoder.receive_frame(&mut audio_frame).is_ok() {
+        //                 let samples: Vec<i16> =
+        //                     audio_frame.data(0).iter().map(|&s| s as i16).collect();
+
+        //                 // Print audio frame information
+        //                 println!(
+        //                     "Playing audio frame: {} samples, channels: {}, sample rate: {}",
+        //                     samples.len(),
+        //                     audio_frame.channels(),
+        //                     sample_rate // Use the stored sample rate
+        //                 );
+
+        //                 // Create a source from the audio samples
+        //                 let source = rodio::buffer::SamplesBuffer::new(
+        //                     audio_frame.channels() as u16,
+        //                     sample_rate.into(), // Use the stored sample rate
+        //                     samples,
+        //                 );
+
+        //                 // Play the audio
+        //                 stream_handle.play_raw(source.convert_samples()).unwrap();
+        //             }
+        //         }
+        //     }
+        // });
+
+        let running = Arc::new(Mutex::new(true)); // Shared state to control playback
+        let running_clone = Arc::clone(&running);
+
+        // Set up Ctrl+C handler
+        ctrlc::set_handler(move || {
+            let mut is_running = running_clone.lock().unwrap();
+            *is_running = false; // Set running to false to stop playback
+        })
+        .expect("Error setting Ctrl-C handler");
+
+        let mut terminal = init_terminal()?; // Initialize terminal for UI
+        let mut app = App::new(); // Create a new App instance
+
+        // Initialize ffmpeg and open the video file
+        let mut ictx = ffmpeg::format::input(&file)?;
+
+        let audio_stream = ictx
+            .streams()
+            .best(ffmpeg::media::Type::Audio)
+            .ok_or(ffmpeg::Error::StreamNotFound)?;
+        let audio_stream_index = audio_stream.index();
+        let audio_context_decoder =
+            ffmpeg::codec::context::Context::from_parameters(audio_stream.parameters())?;
+        let mut audio_decoder = audio_context_decoder.decoder().audio()?;
+        let audio_frame_rate = f64::from(audio_stream.rate());
+
+        // Find the best video stream
+        let video_stream = ictx
+            .streams()
+            .best(ffmpeg::media::Type::Video)
+            .ok_or(ffmpeg::Error::StreamNotFound)?;
+        let video_stream_index = video_stream.index();
+        let video_context_decoder =
+            ffmpeg::codec::context::Context::from_parameters(video_stream.parameters())?;
+        let mut video_decoder = video_context_decoder.decoder().video()?;
+
+        // Create a scaler to convert the video frames to RGB format
+        let mut scaler = ffmpeg::software::scaling::context::Context::get(
+            video_decoder.format(),
+            video_decoder.width(),
+            video_decoder.height(),
+            ffmpeg::format::Pixel::RGB24,
+            video_decoder.width(),
+            video_decoder.height(),
+            ffmpeg::software::scaling::flag::Flags::BILINEAR,
+        )?;
+
+        let video_frame_rate = f64::from(video_stream.rate());
+        let target_frame_rate = args.frame_rate.unwrap_or(video_frame_rate as f32);
+        let frame_time_ns = (1e9 / target_frame_rate as f64) as u64; // Calculate frame duration in nanoseconds
+
+        // Process each packet in the video
+        for (stream, packet) in ictx.packets() {
+            if stream.index() == video_stream_index {
+                video_decoder.send_packet(&packet)?;
+                let mut decoded = ffmpeg::frame::Video::empty();
+
+                while video_decoder.receive_frame(&mut decoded).is_ok() {
+                    let mut rgb_frame = ffmpeg::frame::Video::empty();
+                    scaler.run(&decoded, &mut rgb_frame)?;
+
+                    // Convert the frame to an image::ImageBuffer
+                    let image: ImageBuffer<Rgb<u8>, _> = ImageBuffer::from_raw(
+                        rgb_frame.width(),
+                        rgb_frame.height(),
+                        rgb_frame.data(0).to_vec(),
+                    )
+                    .unwrap();
+
+                    // Convert the image to ASCII art
+                    let options = converter::AsciiOptions::new(200, 100, 1.0); // Set options
+                    app.art = converter::ImageConverter::from_image_buffer(image)
+                        .to_ascii_art(Some(options));
+
+                    // Draw the updated ASCII art in the terminal
+                    let _ = terminal.draw(|frame| app.ui(frame));
+
+                    // Check if playback should stop
+                    if !*running.lock().unwrap() {
+                        break;
+                    }
+
+                    // Optional: Add a delay for frame rate control
+                    let start_time = Instant::now();
+                    let processed_frames = 1; // Assuming one frame processed
+                    let target_time =
+                        start_time + Duration::from_nanos(processed_frames * frame_time_ns);
+                    let now = Instant::now();
+                    if now < target_time {
+                        std::thread::sleep(target_time - now);
+                    }
+                }
+            }
+        }
+
+        let _ = restore_terminal(); // Restore terminal after playback
+                                    // audio_thread.join().unwrap(); // Ensure audio thread finishes
+        Ok("Video playback finished".to_string())
     }
 
     pub fn run(file: String) -> io::Result<String> {
@@ -118,73 +274,63 @@ impl App {
                 if let Event::Key(key) = event::read()? {
                     if key.kind == KeyEventKind::Press {
                         match key.code {
-                            KeyCode::Right => {
-                                match app.selected_field {
-                                    Fields::Width => {
-                                        app.width += 1;
-                                    },
-                                    Fields::Height => {
-                                        app.height += 1;
-                                    },
-                                    Fields::Gamma => {
-                                        app.gamma += 0.1;
-                                    },
-                                    Fields::Finish => {}
+                            KeyCode::Right => match app.selected_field {
+                                Fields::Width => {
+                                    app.width += 1;
+                                }
+                                Fields::Height => {
+                                    app.height += 1;
+                                }
+                                Fields::Gamma => {
+                                    app.gamma += 0.1;
+                                }
+                                Fields::Finish => {}
+                            },
+                            KeyCode::Left => match app.selected_field {
+                                Fields::Width => {
+                                    app.width -= 1;
+                                }
+                                Fields::Height => {
+                                    app.height -= 1;
+                                }
+                                Fields::Gamma => {
+                                    app.gamma -= 0.1;
+                                }
+                                Fields::Finish => {}
+                            },
+                            KeyCode::Up => match app.selected_field {
+                                Fields::Width => {
+                                    app.selected_field = Fields::Finish;
+                                }
+                                Fields::Height => {
+                                    app.selected_field = Fields::Width;
+                                }
+                                Fields::Gamma => {
+                                    app.selected_field = Fields::Height;
+                                }
+                                Fields::Finish => {
+                                    app.selected_field = Fields::Gamma;
                                 }
                             },
-                            KeyCode::Left => {
-                                match app.selected_field {
-                                    Fields::Width => {
-                                        app.width -= 1;
-                                    },
-                                    Fields::Height => {
-                                        app.height -= 1;
-                                    },
-                                    Fields::Gamma => {
-                                        app.gamma -= 0.1;
-                                    },
-                                    Fields::Finish => {}
+                            KeyCode::Down => match app.selected_field {
+                                Fields::Width => {
+                                    app.selected_field = Fields::Height;
+                                }
+                                Fields::Height => {
+                                    app.selected_field = Fields::Gamma;
+                                }
+                                Fields::Gamma => {
+                                    app.selected_field = Fields::Finish;
+                                }
+                                Fields::Finish => {
+                                    app.selected_field = Fields::Width;
                                 }
                             },
-                            KeyCode::Up => {
-                                match app.selected_field {
-                                    Fields::Width => {
-                                        app.selected_field = Fields::Finish;
-                                    },
-                                    Fields::Height => {
-                                        app.selected_field = Fields::Width;
-                                    },
-                                    Fields::Gamma => {
-                                        app.selected_field = Fields::Height;
-                                    },
-                                    Fields::Finish => {
-                                        app.selected_field = Fields::Gamma;
-                                    }
+                            KeyCode::Enter => match app.selected_field {
+                                Fields::Finish => {
+                                    break;
                                 }
-                            },
-                            KeyCode::Down => {
-                                match app.selected_field {
-                                    Fields::Width => {
-                                        app.selected_field = Fields::Height;
-                                    },
-                                    Fields::Height => {
-                                        app.selected_field = Fields::Gamma;
-                                    },
-                                    Fields::Gamma => {
-                                        app.selected_field = Fields::Finish;
-                                    },
-                                    Fields::Finish => {
-                                        app.selected_field = Fields::Width;
-                                    }
-                                }
-                            },
-                            KeyCode::Enter => {
-                                match app.selected_field {
-                                    Fields::Finish => {
-                                        break;
-                                    },
-                                    _ => {}
-                                }
+                                _ => {}
                             },
                             _ => {}
                         }
@@ -203,9 +349,7 @@ impl App {
         return Ok(app.art);
     }
 
-    fn on_tick(&mut self) {
-    
-    }
+    fn on_tick(&mut self) {}
 
     fn ui(&self, frame: &mut Frame) {
         let main_layout = Layout::default()
@@ -218,18 +362,50 @@ impl App {
     }
 
     fn boxes_options(&self, area: Rect) -> impl Widget {
-        let (left, right, bottom, top) = (0.0, area.width as f64, 0.0, area.height as f64 * 2.0 - 4.0);
+        let (left, right, bottom, top) =
+            (0.0, area.width as f64, 0.0, area.height as f64 * 2.0 - 4.0);
 
         let width = self.width.to_string();
-        let width_text = format!("Width: {} {}", width, if self.selected_field == Fields::Width { "<" } else { "" });
+        let width_text = format!(
+            "Width: {} {}",
+            width,
+            if self.selected_field == Fields::Width {
+                "<"
+            } else {
+                ""
+            }
+        );
 
         let height = self.height.to_string();
-        let height_text = format!("Height: {} {}", height, if self.selected_field == Fields::Height { "<" } else { "" });
+        let height_text = format!(
+            "Height: {} {}",
+            height,
+            if self.selected_field == Fields::Height {
+                "<"
+            } else {
+                ""
+            }
+        );
 
         let gamma = self.gamma.to_string();
-        let gamma_text = format!("Gamma: {} {}", gamma, if self.selected_field == Fields::Gamma { "<" } else { "" });
+        let gamma_text = format!(
+            "Gamma: {} {}",
+            gamma,
+            if self.selected_field == Fields::Gamma {
+                "<"
+            } else {
+                ""
+            }
+        );
 
-        let confirm_text = format!("Confirm {}", if self.selected_field == Fields::Finish { "<" } else { "" });
+        let confirm_text = format!(
+            "Confirm {}",
+            if self.selected_field == Fields::Finish {
+                "<"
+            } else {
+                ""
+            }
+        );
 
         Canvas::default()
             .block(Block::default().borders(Borders::ALL).title("Options"))
@@ -252,7 +428,8 @@ impl App {
     }
 
     fn boxes_canvas(&self, area: Rect) -> impl Widget {
-        let (left, right, bottom, top) = (0.0, area.width as f64, 0.0, area.height as f64 * 2.0 - 4.0);
+        let (left, right, bottom, top) =
+            (0.0, area.width as f64, 0.0, area.height as f64 * 2.0 - 4.0);
 
         let art = self.art.clone();
 
@@ -269,12 +446,12 @@ impl App {
                     color: Color::White,
                 });
                 let mut x = 1.0;
-                let mut y = top - 2.0; 
+                let mut y = top - 2.0;
 
                 for c in art.chars() {
                     if c == '\n' {
                         x = 1.0;
-                        y -= 1.0; 
+                        y -= 1.0;
                         continue;
                     }
                     ctx.print(x, y, c.to_string());
