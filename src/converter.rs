@@ -21,7 +21,7 @@ impl AsciiOptions {
 /// Default implementation for the ASCII art conversion options.
 impl Default for AsciiOptions {
     fn default() -> Self {
-        Self::new(80, 80, 1.0)
+        Self::new(160, 90, 1.0)
     }
 }
 

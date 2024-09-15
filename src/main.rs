@@ -1,8 +1,8 @@
 use crate::converter::ToAsciiArt;
 use clap::Parser;
 use ffmpeg_next as ffmpeg;
-use image::{io::Reader as ImageReader, ImageBuffer, Rgb};
-use rodio::{self, Decoder, Source};
+use image::{ImageBuffer, Rgb};
+use rodio::{self};
 
 use std::{
     io::{self, stdout, BufReader, Stdout},
@@ -11,7 +11,6 @@ use std::{
 };
 
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEventKind},
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
     ExecutableCommand,
 };
@@ -30,16 +29,16 @@ pub struct Args {
     #[arg(long, default_value = "")]
     file: String,
     /// The width of the ASCII art
-    #[arg(long, default_value = "240")]
+    #[arg(long, default_value = "160")]
     width: u32,
     /// The height of the ASCII art
-    #[arg(long, default_value = "120")]
+    #[arg(long, default_value = "90")]
     height: u32,
     /// The gamma of the ASCII art
-    #[arg(long, default_value = "0.8")]
+    #[arg(long, default_value = "1.0")]
     gamma: f32,
     /// The target frame rate
-    #[arg(long, default_value = "30.0")]
+    #[arg(long, default_value = "60.0")]
     frame_rate: Option<f32>,
     /// Whether or not to live edit the ASCII art
     #[arg(long, default_value = "false")]
@@ -48,39 +47,9 @@ pub struct Args {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
-    match args.file.ends_with(".mp4") {
-        true => {
-            let result = App::run_video(args.file.clone(), args); // Call video run method
-            println!("{}", result.unwrap());
-            Ok(())
-        }
-        false => match args.live {
-            true => {
-                let file = args.file;
-
-                if !std::path::Path::new(&file).exists() {
-                    return Err("File does not exist".into());
-                }
-
-                let result = App::run(file);
-
-                println!("{}", result.unwrap());
-
-                Ok(())
-            }
-            false => {
-                let open_file = ImageReader::open(args.file).unwrap();
-                let image = open_file.decode().unwrap();
-                let converter = converter::ImageConverter::new(image);
-                let options = converter::AsciiOptions::new(args.width, args.height, args.gamma);
-                let art = converter.to_ascii_art(Some(options));
-
-                println!("{}", art);
-
-                Ok(())
-            }
-        },
-    }
+    let result = App::run_video(args.file.clone(), args); // Call video run method
+    println!("{}", result.unwrap());
+    Ok(())
 }
 
 struct App {
@@ -103,8 +72,8 @@ impl App {
     fn new() -> App {
         App {
             art: String::new(),
-            width: 80,
-            height: 50,
+            width: 160,
+            height: 90,
             gamma: 1.0,
             selected_field: Fields::Width,
         }
@@ -115,7 +84,6 @@ impl App {
         ffmpeg::init().unwrap();
 
         let running = Arc::new(Mutex::new(true));
-        let running_clone = Arc::clone(&running);
 
         let mut terminal = init_terminal()?;
         let mut app = App::new();
@@ -132,7 +100,7 @@ impl App {
         });
         // Audio playback thread
         let audio_thread = std::thread::spawn(move || {
-            let result = Self::play_audio(&file, &running_clone);
+            let result = Self::play_audio(&file);
             if let Err(e) = result {
                 eprintln!("Audio playback error: {}", e);
             }
@@ -177,9 +145,9 @@ impl App {
             ffmpeg::software::scaling::flag::Flags::BILINEAR,
         )?;
 
-        let video_frame_rate = f64::from(video_stream.rate());
-        let target_frame_rate = args.frame_rate.unwrap_or(video_frame_rate as f32);
-        let frame_time_ns = (1e9 / target_frame_rate as f64) as u64; // Calculate frame duration in nanoseconds
+        // Get the video's time base
+        let video_time_base: f64 = video_stream.time_base().into();
+        let start_time = Instant::now();
 
         // Process each packet in the video
         for (stream, packet) in ictx.packets() {
@@ -193,6 +161,20 @@ impl App {
                 let mut decoded = ffmpeg::frame::Video::empty();
 
                 while video_decoder.receive_frame(&mut decoded).is_ok() {
+                    if let Some(pts) = decoded.pts() {
+                        let frame_timestamp = pts as f64 * video_time_base;
+
+                        let elapsed = Instant::now().duration_since(start_time);
+                        let elapsed_secs = elapsed.as_secs_f64();
+
+                        if frame_timestamp > elapsed_secs {
+                            let sleep_duration =
+                                Duration::from_secs_f64(frame_timestamp - elapsed_secs);
+                            std::thread::sleep(sleep_duration);
+                        }
+                    }
+
+                    // Convert the frame to RGB
                     let mut rgb_frame = ffmpeg::frame::Video::empty();
                     scaler.run(&decoded, &mut rgb_frame)?;
 
@@ -205,22 +187,12 @@ impl App {
                     .unwrap();
 
                     // Convert the image to ASCII art
-                    let options = converter::AsciiOptions::new(800, 400, 1.0); // Set options
+                    let options = converter::AsciiOptions::new(args.width, args.width, args.gamma); // Adjust options as needed
                     app.art = converter::ImageConverter::from_image_buffer(image)
                         .to_ascii_art(Some(options));
 
                     // Draw the updated ASCII art in the terminal
                     let _ = terminal.draw(|frame| app.ui(frame));
-
-                    // Optional: Add a delay for frame rate control
-                    let start_time = Instant::now();
-                    let processed_frames = 1; // Assuming one frame processed
-                    let target_time =
-                        start_time + Duration::from_nanos(processed_frames * frame_time_ns);
-                    let now = Instant::now();
-                    if now < target_time {
-                        std::thread::sleep(target_time - now);
-                    }
                 }
             }
         }
@@ -228,144 +200,16 @@ impl App {
         Ok(())
     }
 
-    fn play_audio(
-        file: &str,
-        running: &Arc<Mutex<bool>>,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        let mut ictx = ffmpeg::format::input(&file)?;
+    fn play_audio(file: &str) -> Result<(), Box<dyn std::error::Error>> {
         let music_file = std::fs::File::open(file).unwrap();
         let decoder = rodio::Decoder::new(BufReader::new(music_file)).unwrap();
         let (_stream, stream_handle) = rodio::OutputStream::try_default()?;
         let sink = rodio::Sink::try_new(&stream_handle)?;
 
         sink.append(decoder);
-        // let audio_stream = ictx
-        //     .streams()
-        //     .best(ffmpeg::media::Type::Audio)
-        //     .ok_or(ffmpeg::Error::StreamNotFound)?;
-        // let audio_stream_index = audio_stream.index();
-        // let audio_context_decoder =
-        //     ffmpeg::codec::context::Context::from_parameters(audio_stream.parameters())?;
-        // let mut audio_decoder = audio_context_decoder.decoder().audio()?;
-
-        // let sample_rate = u32::from(audio_stream.rate());
-
-        // for (stream, packet) in ictx.packets() {
-        //     if stream.index() == audio_stream_index {
-        //         audio_decoder.send_packet(&packet)?;
-        //         let mut audio_frame = ffmpeg::frame::Audio::empty();
-
-        //         while audio_decoder.receive_frame(&mut audio_frame).is_ok() {
-        //             let samples: Vec<i16> = audio_frame.data(0).iter().map(|&s| s as i16).collect();
-
-        //             let source = rodio::buffer::SamplesBuffer::new(
-        //                 audio_frame.channels(),
-        //                 sample_rate,
-        //                 samples,
-        //             );
-
-        //             sink.append(source);
-        //         }
-        //     }
-        // }
 
         sink.sleep_until_end();
         Ok(())
-    }
-
-    pub fn run(file: String) -> io::Result<String> {
-        let mut terminal = init_terminal()?;
-        let mut app = App::new();
-        let mut last_tick = Instant::now();
-        let tick_rate = Duration::from_millis(33);
-
-        let open_file = ImageReader::open(file).unwrap();
-        let image = open_file.decode().unwrap();
-        let converter = converter::ImageConverter::new(image);
-
-        loop {
-            let options = converter::AsciiOptions::new(app.width, app.height, app.gamma);
-            app.art = converter.to_ascii_art(Some(options));
-
-            let _ = terminal.draw(|frame| app.ui(frame));
-            let timeout = tick_rate.saturating_sub(last_tick.elapsed());
-            if event::poll(timeout)? {
-                if let Event::Key(key) = event::read()? {
-                    if key.kind == KeyEventKind::Press {
-                        match key.code {
-                            KeyCode::Right => match app.selected_field {
-                                Fields::Width => {
-                                    app.width += 1;
-                                }
-                                Fields::Height => {
-                                    app.height += 1;
-                                }
-                                Fields::Gamma => {
-                                    app.gamma += 0.1;
-                                }
-                                Fields::Finish => {}
-                            },
-                            KeyCode::Left => match app.selected_field {
-                                Fields::Width => {
-                                    app.width -= 1;
-                                }
-                                Fields::Height => {
-                                    app.height -= 1;
-                                }
-                                Fields::Gamma => {
-                                    app.gamma -= 0.1;
-                                }
-                                Fields::Finish => {}
-                            },
-                            KeyCode::Up => match app.selected_field {
-                                Fields::Width => {
-                                    app.selected_field = Fields::Finish;
-                                }
-                                Fields::Height => {
-                                    app.selected_field = Fields::Width;
-                                }
-                                Fields::Gamma => {
-                                    app.selected_field = Fields::Height;
-                                }
-                                Fields::Finish => {
-                                    app.selected_field = Fields::Gamma;
-                                }
-                            },
-                            KeyCode::Down => match app.selected_field {
-                                Fields::Width => {
-                                    app.selected_field = Fields::Height;
-                                }
-                                Fields::Height => {
-                                    app.selected_field = Fields::Gamma;
-                                }
-                                Fields::Gamma => {
-                                    app.selected_field = Fields::Finish;
-                                }
-                                Fields::Finish => {
-                                    app.selected_field = Fields::Width;
-                                }
-                            },
-                            KeyCode::Enter => match app.selected_field {
-                                Fields::Finish => {
-                                    break;
-                                }
-                                _ => {}
-                            },
-                            _ => {}
-                        }
-                    }
-                }
-            }
-
-            if last_tick.elapsed() >= tick_rate {
-                app.on_tick();
-                last_tick = Instant::now();
-            }
-        }
-
-        let _ = restore_terminal();
-
-        return Ok(app.art);
     }
 
     fn on_tick(&mut self) {}
