@@ -2,10 +2,10 @@ use crate::converter::ToAsciiArt;
 use clap::Parser;
 use ffmpeg_next as ffmpeg;
 use image::{io::Reader as ImageReader, ImageBuffer, Rgb};
-use rodio::{self, Source};
+use rodio::{self, Decoder, Source};
 
 use std::{
-    io::{self, stdout, Stdout},
+    io::{self, stdout, BufReader, Stdout},
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
@@ -23,7 +23,7 @@ use ratatui::{
 
 mod converter;
 
-#[derive(Parser, Debug)]
+#[derive(Parser, Clone, Debug)]
 #[command(author,version,about,long_about = None)]
 pub struct Args {
     /// The path to an image file
@@ -111,74 +111,50 @@ impl App {
     }
 
     pub fn run_video(file: String, args: Args) -> io::Result<String> {
-        // Initialize audio output
-        let (_stream, stream_handle) = rodio::OutputStream::try_default().unwrap();
+        // Initialize ffmpeg and open the video file
+        ffmpeg::init().unwrap();
 
-        // Find the audio stream
-
-        // Create a decoder for the audio stream
-
-        // Get the sample rate from the audio stream parameters
-        // let sample_rate = audio_stream.avg_frame_rate();
-
-        // // Start audio playback in a separate thread
-        // let audio_thread = std::thread::spawn(move || {
-        //     let mut audio_packet = ffmpeg::Packet::empty();
-        //     while ictx.packets().next().is_some() {
-        //         if audio_packet.stream() == audio_stream_index {
-        //             audio_decoder.send_packet(&audio_packet).unwrap();
-        //             let mut audio_frame = ffmpeg::frame::Audio::empty();
-        //             while audio_decoder.receive_frame(&mut audio_frame).is_ok() {
-        //                 let samples: Vec<i16> =
-        //                     audio_frame.data(0).iter().map(|&s| s as i16).collect();
-
-        //                 // Print audio frame information
-        //                 println!(
-        //                     "Playing audio frame: {} samples, channels: {}, sample rate: {}",
-        //                     samples.len(),
-        //                     audio_frame.channels(),
-        //                     sample_rate // Use the stored sample rate
-        //                 );
-
-        //                 // Create a source from the audio samples
-        //                 let source = rodio::buffer::SamplesBuffer::new(
-        //                     audio_frame.channels() as u16,
-        //                     sample_rate.into(), // Use the stored sample rate
-        //                     samples,
-        //                 );
-
-        //                 // Play the audio
-        //                 stream_handle.play_raw(source.convert_samples()).unwrap();
-        //             }
-        //         }
-        //     }
-        // });
-
-        let running = Arc::new(Mutex::new(true)); // Shared state to control playback
+        let running = Arc::new(Mutex::new(true));
         let running_clone = Arc::clone(&running);
 
-        // Set up Ctrl+C handler
-        ctrlc::set_handler(move || {
-            let mut is_running = running_clone.lock().unwrap();
-            *is_running = false; // Set running to false to stop playback
-        })
-        .expect("Error setting Ctrl-C handler");
+        let mut terminal = init_terminal()?;
+        let mut app = App::new();
 
-        let mut terminal = init_terminal()?; // Initialize terminal for UI
-        let mut app = App::new(); // Create a new App instance
+        // Video playback thread
+        let video_file = file.clone();
+        let video_args = args.clone();
+        let video_thread = std::thread::spawn(move || {
+            let result =
+                Self::play_video(&video_file, &video_args, &mut terminal, &mut app, &running);
+            if let Err(e) = result {
+                eprintln!("Video playback error: {}", e);
+            }
+        });
+        // Audio playback thread
+        let audio_thread = std::thread::spawn(move || {
+            let result = Self::play_audio(&file, &running_clone);
+            if let Err(e) = result {
+                eprintln!("Audio playback error: {}", e);
+            }
+        });
 
-        // Initialize ffmpeg and open the video file
+        // Wait for both threads to finish
+        video_thread.join().unwrap();
+        audio_thread.join().unwrap();
+
+        let _ = restore_terminal();
+
+        Ok("Video and audio playback finished".to_string())
+    }
+
+    fn play_video(
+        file: &str,
+        args: &Args,
+        terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+        app: &mut App,
+        running: &Arc<Mutex<bool>>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let mut ictx = ffmpeg::format::input(&file)?;
-
-        let audio_stream = ictx
-            .streams()
-            .best(ffmpeg::media::Type::Audio)
-            .ok_or(ffmpeg::Error::StreamNotFound)?;
-        let audio_stream_index = audio_stream.index();
-        let audio_context_decoder =
-            ffmpeg::codec::context::Context::from_parameters(audio_stream.parameters())?;
-        let mut audio_decoder = audio_context_decoder.decoder().audio()?;
-        let audio_frame_rate = f64::from(audio_stream.rate());
 
         // Find the best video stream
         let video_stream = ictx
@@ -207,8 +183,13 @@ impl App {
 
         // Process each packet in the video
         for (stream, packet) in ictx.packets() {
+            if !*running.lock().unwrap() {
+                break;
+            }
+
             if stream.index() == video_stream_index {
                 video_decoder.send_packet(&packet)?;
+
                 let mut decoded = ffmpeg::frame::Video::empty();
 
                 while video_decoder.receive_frame(&mut decoded).is_ok() {
@@ -224,17 +205,12 @@ impl App {
                     .unwrap();
 
                     // Convert the image to ASCII art
-                    let options = converter::AsciiOptions::new(200, 100, 1.0); // Set options
+                    let options = converter::AsciiOptions::new(800, 400, 1.0); // Set options
                     app.art = converter::ImageConverter::from_image_buffer(image)
                         .to_ascii_art(Some(options));
 
                     // Draw the updated ASCII art in the terminal
                     let _ = terminal.draw(|frame| app.ui(frame));
-
-                    // Check if playback should stop
-                    if !*running.lock().unwrap() {
-                        break;
-                    }
 
                     // Optional: Add a delay for frame rate control
                     let start_time = Instant::now();
@@ -249,9 +225,52 @@ impl App {
             }
         }
 
-        let _ = restore_terminal(); // Restore terminal after playback
-                                    // audio_thread.join().unwrap(); // Ensure audio thread finishes
-        Ok("Video playback finished".to_string())
+        Ok(())
+    }
+
+    fn play_audio(
+        file: &str,
+        running: &Arc<Mutex<bool>>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut ictx = ffmpeg::format::input(&file)?;
+        let music_file = std::fs::File::open(file).unwrap();
+        let decoder = rodio::Decoder::new(BufReader::new(music_file)).unwrap();
+        let (_stream, stream_handle) = rodio::OutputStream::try_default()?;
+        let sink = rodio::Sink::try_new(&stream_handle)?;
+
+        sink.append(decoder);
+        // let audio_stream = ictx
+        //     .streams()
+        //     .best(ffmpeg::media::Type::Audio)
+        //     .ok_or(ffmpeg::Error::StreamNotFound)?;
+        // let audio_stream_index = audio_stream.index();
+        // let audio_context_decoder =
+        //     ffmpeg::codec::context::Context::from_parameters(audio_stream.parameters())?;
+        // let mut audio_decoder = audio_context_decoder.decoder().audio()?;
+
+        // let sample_rate = u32::from(audio_stream.rate());
+
+        // for (stream, packet) in ictx.packets() {
+        //     if stream.index() == audio_stream_index {
+        //         audio_decoder.send_packet(&packet)?;
+        //         let mut audio_frame = ffmpeg::frame::Audio::empty();
+
+        //         while audio_decoder.receive_frame(&mut audio_frame).is_ok() {
+        //             let samples: Vec<i16> = audio_frame.data(0).iter().map(|&s| s as i16).collect();
+
+        //             let source = rodio::buffer::SamplesBuffer::new(
+        //                 audio_frame.channels(),
+        //                 sample_rate,
+        //                 samples,
+        //             );
+
+        //             sink.append(source);
+        //         }
+        //     }
+        // }
+
+        sink.sleep_until_end();
+        Ok(())
     }
 
     pub fn run(file: String) -> io::Result<String> {
