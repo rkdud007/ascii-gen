@@ -1,4 +1,4 @@
-use image::{DynamicImage, GenericImageView, ImageBuffer, Pixel, Rgb};
+use image::{DynamicImage, GenericImageView, ImageBuffer, Luma, Pixel};
 
 /// Options for the ASCII art conversion.
 pub struct AsciiOptions {
@@ -37,13 +37,9 @@ pub struct ImageConverter {
 
 /// Implementation for converting an image to ASCII art.
 impl ImageConverter {
-    pub fn new(image: DynamicImage) -> Self {
-        Self { image }
-    }
-
-    pub fn from_image_buffer(image: ImageBuffer<Rgb<u8>, Vec<u8>>) -> Self {
+    pub fn from_image_buffer(image: ImageBuffer<Luma<u8>, Vec<u8>>) -> Self {
         Self {
-            image: DynamicImage::ImageRgb8(image),
+            image: DynamicImage::ImageLuma8(image),
         }
     }
 }
@@ -91,14 +87,15 @@ impl ToAsciiArt for ImageConverter {
                 let luminance = ((base_luminance as f32 / 255.0).powf(gamma) * 255.0) as u8;
 
                 let character = match luminance {
-                    0..=31 => '#',
-                    32..=63 => '@',
-                    64..=95 => '8',
-                    96..=127 => '&',
-                    128..=159 => 'o',
-                    160..=191 => ':',
-                    192..=223 => '*',
-                    224..=255 => '.',
+                    0..=25 => '#',
+                    26..=51 => '@',
+                    52..=76 => '8',
+                    77..=102 => '&',
+                    103..=127 => 'o',
+                    128..=153 => '*',
+                    154..=178 => ':',
+                    179..=204 => ',',
+                    205..=255 => '.',
                 };
 
                 ascii_art.push(character);

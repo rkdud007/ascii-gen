@@ -1,7 +1,7 @@
 use crate::converter::ToAsciiArt;
 use clap::Parser;
 use ffmpeg_next as ffmpeg;
-use image::{ImageBuffer, Rgb};
+use image::{ImageBuffer, Luma};
 use rodio::{self};
 
 use std::{
@@ -178,11 +178,11 @@ impl App {
                     let mut rgb_frame = ffmpeg::frame::Video::empty();
                     scaler.run(&decoded, &mut rgb_frame)?;
 
-                    // Convert the frame to an image::ImageBuffer
-                    let image: ImageBuffer<Rgb<u8>, _> = ImageBuffer::from_raw(
+                    // Convert the frame to a grayscale ImageBuffer
+                    let image: ImageBuffer<Luma<u8>, Vec<u8>> = ImageBuffer::from_raw(
                         rgb_frame.width(),
                         rgb_frame.height(),
-                        rgb_frame.data(0).to_vec(),
+                        rgb_frame.data(0).iter().step_by(3).copied().collect(),
                     )
                     .unwrap();
 
@@ -211,8 +211,6 @@ impl App {
         sink.sleep_until_end();
         Ok(())
     }
-
-    fn on_tick(&mut self) {}
 
     fn ui(&self, frame: &mut Frame) {
         let main_layout = Layout::default()
